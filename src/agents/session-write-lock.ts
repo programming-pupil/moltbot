@@ -19,7 +19,9 @@ type CleanupSignal = (typeof CLEANUP_SIGNALS)[number];
 const cleanupHandlers = new Map<CleanupSignal, () => void>();
 
 function isAlive(pid: number): boolean {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
   try {
     process.kill(pid, 0);
     return true;
@@ -35,8 +37,8 @@ function isAlive(pid: number): boolean {
 function releaseAllLocksSync(): void {
   for (const [sessionFile, held] of HELD_LOCKS) {
     try {
-      if (typeof held.handle.fd === "number") {
-        fsSync.closeSync(held.handle.fd);
+      if (typeof held.handle.close === "function") {
+        void held.handle.close().catch(() => {});
       }
     } catch {
       // Ignore errors during cleanup - best effort
@@ -57,7 +59,9 @@ function handleTerminationSignal(signal: CleanupSignal): void {
   const shouldReraise = process.listenerCount(signal) === 1;
   if (shouldReraise) {
     const handler = cleanupHandlers.get(signal);
-    if (handler) process.off(signal, handler);
+    if (handler) {
+      process.off(signal, handler);
+    }
     try {
       process.kill(process.pid, signal);
     } catch {
@@ -67,7 +71,9 @@ function handleTerminationSignal(signal: CleanupSignal): void {
 }
 
 function registerCleanupHandlers(): void {
-  if (cleanupRegistered) return;
+  if (cleanupRegistered) {
+    return;
+  }
   cleanupRegistered = true;
 
   // Cleanup on normal exit and process.exit() calls
@@ -91,8 +97,12 @@ async function readLockPayload(lockPath: string): Promise<LockFilePayload | null
   try {
     const raw = await fs.readFile(lockPath, "utf8");
     const parsed = JSON.parse(raw) as Partial<LockFilePayload>;
-    if (typeof parsed.pid !== "number") return null;
-    if (typeof parsed.createdAt !== "string") return null;
+    if (typeof parsed.pid !== "number") {
+      return null;
+    }
+    if (typeof parsed.createdAt !== "string") {
+      return null;
+    }
     return { pid: parsed.pid, createdAt: parsed.createdAt };
   } catch {
     return null;
@@ -127,9 +137,13 @@ export async function acquireSessionWriteLock(params: {
     return {
       release: async () => {
         const current = HELD_LOCKS.get(normalizedSessionFile);
-        if (!current) return;
+        if (!current) {
+          return;
+        }
         current.count -= 1;
-        if (current.count > 0) return;
+        if (current.count > 0) {
+          return;
+        }
         HELD_LOCKS.delete(normalizedSessionFile);
         await current.handle.close();
         await fs.rm(current.lockPath, { force: true });
@@ -151,9 +165,13 @@ export async function acquireSessionWriteLock(params: {
       return {
         release: async () => {
           const current = HELD_LOCKS.get(normalizedSessionFile);
-          if (!current) return;
+          if (!current) {
+            return;
+          }
           current.count -= 1;
-          if (current.count > 0) return;
+          if (current.count > 0) {
+            return;
+          }
           HELD_LOCKS.delete(normalizedSessionFile);
           await current.handle.close();
           await fs.rm(current.lockPath, { force: true });
@@ -161,13 +179,49 @@ export async function acquireSessionWriteLock(params: {
       };
     } catch (err) {
       const code = (err as { code?: unknown }).code;
-      if (code !== "EEXIST") throw err;
+      if (code !== "EEXIST") {
+        throw err;
+      }
       const payload = await readLockPayload(lockPath);
       const createdAt = payload?.createdAt ? Date.parse(payload.createdAt) : NaN;
       const stale = !Number.isFinite(createdAt) || Date.now() - createdAt > staleMs;
       const alive = payload?.pid ? isAlive(payload.pid) : false;
       if (stale || !alive) {
-        await fs.rm(lockPath, { force: true });
+        // Atomic stale lock takeover: rename instead of delete+create
+        // This closes the TOCTOU race window
+        const tempLockPath = `${lockPath}.${process.pid}.${Date.now()}`;
+        try {
+          const tempHandle = await fs.open(tempLockPath, "wx");
+          await tempHandle.writeFile(
+            JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2),
+            "utf8",
+          );
+          await tempHandle.close();
+          // Atomic rename - if another process already took over, this will fail
+          await fs.rename(tempLockPath, lockPath);
+          // Reopen the lock file to hold the handle
+          const handle = await fs.open(lockPath, "r+");
+          HELD_LOCKS.set(normalizedSessionFile, { count: 1, handle, lockPath });
+          return {
+            release: async () => {
+              const current = HELD_LOCKS.get(normalizedSessionFile);
+              if (!current) {
+                return;
+              }
+              current.count -= 1;
+              if (current.count > 0) {
+                return;
+              }
+              HELD_LOCKS.delete(normalizedSessionFile);
+              await current.handle.close();
+              await fs.rm(current.lockPath, { force: true });
+            },
+          };
+        } catch {
+          // Cleanup temp file if takeover failed
+          await fs.rm(tempLockPath, { force: true }).catch(() => {});
+          // Another process won the race, continue waiting
+        }
         continue;
       }
 
